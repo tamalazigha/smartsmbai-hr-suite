@@ -13,6 +13,8 @@ HR Recruitment Suite · Certified Growth Agent · 5 Regions · 6-Agent Pipeline
 </span></div>""",unsafe_allow_html=True)
 with st.sidebar:
     st.markdown("### Pipeline — Step by Step")
+    st.page_link("pages/0A_JD_Builder.py",      label="📝 Agent A — JD Builder",        icon="🅰️")
+    st.page_link("pages/0B_Job_Board.py",       label="📋 Agent B — Job Board",          icon="🅱️")
     st.page_link("pages/1_Email_Inbox.py",      label="📥 Agent 1 — Email Inbox",       icon="1️⃣")
     st.page_link("pages/2_CV_Screening.py",     label="📄 Agent 2 — CV Screening",      icon="2️⃣")
     st.page_link("pages/3_Interviews.py",       label="💬 Agent 3 — Bulk Invitations",  icon="3️⃣")
