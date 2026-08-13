@@ -1,10 +1,9 @@
 """
-jd_agent.py — Agent A backend (SmartSMBAI)
-Two-call approach: structured JSON first, plain-text full_jd second.
-Eliminates unterminated string JSON errors from multi-line prose in JSON.
+jd_agent.py — Agent A backend (SmartSMBAI) v3
+No JSON parsing at all. Uses section delimiters that Claude can't accidentally break.
+Each section is plain text that gets parsed into lists by Python.
 """
-import os, json, re
-from datetime import datetime, timezone
+import os, re
 from dotenv import load_dotenv
 import anthropic
 from database import _sb
@@ -20,7 +19,7 @@ REGION_DETAILS = {
     "Africa":        ("Flutterwave/Paystack/mobile money", "EOR or local contract", "WhatsApp-first, mobile SME outreach, NDPR/POPIA awareness"),
     "Latin America": ("PIX/SPEI/Wise", "EOR or contractor", "WhatsApp Business, referrals, LatAm entrepreneur communities"),
     "Canada":        ("Stripe/Interac", "1099-equivalent contractor", "CASL compliance, bilingual French/English, Canadian chambers"),
-    "USA":           ("Stripe/ACH", "1099 independent contractor", "CAN-SPAM/TCPA awareness, LinkedIn + cold outreach, U.S. chamber networks"),
+    "USA":           ("Stripe/ACH", "1099 independent contractor", "CAN-SPAM/TCPA awareness, LinkedIn outreach, U.S. chamber networks"),
 }
 
 EEO_DEFAULT = (
@@ -30,149 +29,171 @@ EEO_DEFAULT = (
 )
 
 
-def _clean_json(raw: str) -> str:
-    """Strip markdown fences and leading/trailing whitespace."""
-    raw = raw.strip()
-    raw = re.sub(r'^```[a-z]*\n?', '', raw)
-    raw = re.sub(r'\n?```$', '', raw)
-    return raw.strip()
+def _parse_section(text: str, tag: str) -> list:
+    """Extract lines between <TAG> and </TAG> as a cleaned list."""
+    pattern = rf'<{tag}>(.*?)</{tag}>'
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return []
+    block = match.group(1).strip()
+    lines = []
+    for line in block.splitlines():
+        line = line.strip().lstrip('-•*').strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _parse_field(text: str, tag: str) -> str:
+    """Extract single value between <TAG> and </TAG>."""
+    pattern = rf'<{tag}>(.*?)</{tag}>'
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
 
 
 def build_job_description(region: str, eeo: str = EEO_DEFAULT) -> dict:
     """
-    Two-call approach:
-    Call 1 — structured JSON (lists only, no long prose fields).
-    Call 2 — full plain-text JD assembled from structured data.
-    Avoids JSON parse errors caused by multi-line prose inside JSON strings.
+    Single API call using XML-style section tags.
+    No JSON parsing — immune to apostrophes, quotes, and special characters.
     """
     pay_method, contract_type, region_ctx = REGION_DETAILS.get(
         region, ("Stripe", "Contractor", "")
     )
 
-    # ── Call 1: structured fields only ──────────────────────────────
-    structured_prompt = f"""Generate structured content for a SmartSMBAI Certified Growth Agent job posting for the {region} market.
+    prompt = f"""Write a SmartSMBAI Certified Growth Agent job posting for the {region} market.
 
-ROLE: Certified Growth Agent — commission-only partnership (no base salary)
-PLATFORM: SmartSMBAI — productized AI systems (receptionists, lead agents, support assistants) for SMBs
+ROLE: Certified Growth Agent (commission-only, no base salary)
+PLATFORM: SmartSMBAI — AI receptionists, lead agents, support assistants for SMBs
 COMMISSION: 15% build fee + 10% monthly (months 1-12 per client) + 5% territory override
 PAYMENT: {pay_method}
 CONTRACTING: {contract_type}
-REGION: {region_ctx}
-
-REQUIREMENTS:
-- 2+ years B2B sales, SaaS affiliate, agency, or consulting
-- Named SME chamber, trade org, or entrepreneur network in {region}
-- AI tool comfort — can explain value to non-technical SMB owners
-- Commission-only comfort and pipeline management ability
-- Completes 4-hour SmartSMBAI certification before onboarding clients
-
-Return ONLY valid JSON with SHORT string values — NO multi-line strings, NO embedded newlines:
-{{
-  "role_title": "Certified Growth Agent — {region}",
-  "region": "{region}",
-  "role_summary": "One sentence: compelling overview of the opportunity.",
-  "what_youll_do": [
-    "Prospect and close SMB owners in {region} on AI-powered business tools",
-    "Run product demos and handle objections for a commission-based sale",
-    "Onboard clients and monitor AI assistant performance post-launch",
-    "Build and grow a referral network within local SME chambers",
-    "Report pipeline activity and client adoption metrics weekly"
-  ],
-  "what_we_need": [
-    "2+ years B2B sales, agency, SaaS affiliate, or business consulting",
-    "Active membership in a named SME chamber or entrepreneur network in {region}",
-    "Comfortable using and explaining AI tools to non-technical buyers",
-    "Ability to diagnose basic AI output quality issues",
-    "Commission-only comfort with strong pipeline discipline"
-  ],
-  "nice_to_have": [
-    "Experience selling SaaS or tech products to SMBs",
-    "Existing warm relationships with business owners in {region}",
-    "Familiarity with CRM tools and outreach automation"
-  ],
-  "compensation": [
-    "15% commission on each client build fee (one-time)",
-    "10% monthly residual on subscription for first 12 months per client",
-    "5% territory override on closings by any sub-partners you refer",
-    "Payment via {pay_method} — no cap on earnings",
-    "Average active partner earns $2,000-$5,000/month within 6 months"
-  ],
-  "social_teaser_short": "Under 280 chars teaser for X/Twitter about this role.",
-  "social_teaser_linkedin": "3 sentences for a LinkedIn post about this opportunity.",
-  "keywords": ["B2B sales", "commission", "AI", "SaaS", "SMB", "{region}", "Growth Agent", "remote"]
-}}
-
-RULES:
-- Every value must be a short string or array of short strings
-- NO newlines inside any string value
-- NO apostrophes that could break JSON — use the word instead (e.g. "do not" not "don't")
-- Return ONLY the JSON object, nothing else"""
-
-    try:
-        resp1 = client.messages.create(
-            model=MODEL, max_tokens=1500,
-            messages=[{"role": "user", "content": structured_prompt}]
-        )
-        raw1  = _clean_json(resp1.content[0].text)
-        data  = json.loads(raw1)
-    except Exception as e:
-        return {"error": f"Structured generation failed: {e}"}
-
-    # ── Call 2: full plain-text JD ───────────────────────────────────
-    prose_prompt = f"""Write a complete plain-text job posting for SmartSMBAI.
-Use the content below. Write as flowing plain text — no JSON, no code, no markdown fences.
-
-ROLE: {data.get('role_title', f'Certified Growth Agent — {region}')}
-REGION: {region}
 REGION CONTEXT: {region_ctx}
 
-WHAT YOULL DO:
-{chr(10).join('- ' + r for r in data.get('what_youll_do', []))}
+Output your response using EXACTLY these XML section tags. Write real content inside each tag.
 
-WHAT WE NEED:
-{chr(10).join('- ' + r for r in data.get('what_we_need', []))}
+<role_summary>
+One compelling sentence describing this opportunity for a {region} Growth Agent.
+</role_summary>
 
-NICE TO HAVE:
-{chr(10).join('- ' + r for r in data.get('nice_to_have', []))}
+<what_youll_do>
+- First responsibility
+- Second responsibility
+- Third responsibility
+- Fourth responsibility
+- Fifth responsibility
+- Sixth responsibility
+</what_youll_do>
 
-COMPENSATION:
-{chr(10).join('- ' + r for r in data.get('compensation', []))}
+<what_we_need>
+- First requirement
+- Second requirement
+- Third requirement
+- Fourth requirement
+- Fifth requirement
+</what_we_need>
 
-HOW TO APPLY: Send your background and the local business network you would bring to info@smartsmbai.com
-Subject line: Application — Growth Agent — {region} — [Your Name]
+<nice_to_have>
+- First nice-to-have
+- Second nice-to-have
+- Third nice-to-have
+</nice_to_have>
 
-EEO: {eeo}
+<compensation>
+- 15 percent commission on each client build fee paid as a one-time amount
+- 10 percent monthly residual on subscription for first 12 months per client
+- 5 percent territory override on closings by any sub-partners you refer
+- Payment via {pay_method} with no cap on earnings
+- Average active partner earns between 2000 and 5000 USD per month within 6 months
+</compensation>
 
-Write a complete job posting with these sections in order:
-ABOUT SMARTSMBAI / THE OPPORTUNITY / WHAT YOU WILL DO / WHAT WE ARE LOOKING FOR / COMPENSATION / GOOD TO KNOW / HOW TO APPLY
+<social_short>
+Under 280 character teaser for Twitter about this Growth Agent role in {region}.
+</social_short>
 
-Output only the job posting text. No preamble."""
+<social_linkedin>
+Three sentence LinkedIn post about this Growth Agent opportunity in {region}.
+</social_linkedin>
+
+<full_jd>
+CERTIFIED GROWTH AGENT — {region.upper()}
+SmartSMBAI | Commission Partnership | {region}
+
+ABOUT SMARTSMBAI
+[2-3 sentences about SmartSMBAI and what Growth Agents do]
+
+THE OPPORTUNITY
+[2-3 sentences about this specific {region} opportunity]
+
+WHAT YOU WILL DO
+[6 bullet points]
+
+WHAT WE ARE LOOKING FOR
+[5 bullet points of requirements]
+
+NICE TO HAVE
+[3 bullet points]
+
+COMPENSATION
+[5 bullet points with specific commission details]
+
+GOOD TO KNOW
+[2-3 sentences about the commission-only structure, certification, and contractor status]
+
+HOW TO APPLY
+Send your background and the local business network you would bring to info@smartsmbai.com
+Subject line: Application - Growth Agent - {region} - [Your Name]
+
+{eeo}
+</full_jd>
+
+Write real content for every section. Do not repeat the placeholder text above.
+Output only the XML tags and their content — nothing else."""
 
     try:
-        resp2 = client.messages.create(
-            model=MODEL, max_tokens=1500,
-            messages=[{"role": "user", "content": prose_prompt}]
+        resp = client.messages.create(
+            model=MODEL, max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}]
         )
-        full_jd = resp2.content[0].text.strip()
-    except Exception as e:
-        # Fall back to assembling from structured data
-        full_jd = _assemble_jd(data, region, eeo)
+        text = resp.content[0].text
 
-    data["full_jd"]        = full_jd
-    data["eeo_statement"]  = eeo
-    data["pay_method"]     = pay_method
-    data["contract_type"]  = contract_type
-    return data
+        data = {
+            "role_title":           f"Certified Growth Agent — {region}",
+            "region":               region,
+            "role_summary":         _parse_field(text, "role_summary"),
+            "what_youll_do":        _parse_section(text, "what_youll_do"),
+            "what_we_need":         _parse_section(text, "what_we_need"),
+            "nice_to_have":         _parse_section(text, "nice_to_have"),
+            "compensation":         _parse_section(text, "compensation"),
+            "social_teaser_short":  _parse_field(text, "social_short"),
+            "social_teaser_linkedin": _parse_field(text, "social_linkedin"),
+            "full_jd":              _parse_field(text, "full_jd"),
+            "eeo_statement":        eeo,
+            "pay_method":           pay_method,
+            "contract_type":        contract_type,
+            "keywords": [
+                "B2B sales", "commission", "AI", "SaaS", "SMB",
+                region, "Growth Agent", "remote", "affiliate"
+            ],
+        }
+
+        # Fallback: if full_jd is empty, assemble from sections
+        if not data["full_jd"].strip():
+            data["full_jd"] = _assemble_jd(data, region, eeo)
+
+        return data
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _assemble_jd(data: dict, region: str, eeo: str) -> str:
-    """Fallback: assemble plain-text JD from structured fields."""
+    """Fallback: build plain-text JD from parsed sections."""
     lines = [
         f"CERTIFIED GROWTH AGENT — {region.upper()}",
         f"SmartSMBAI | Commission Partnership | {region}",
         "",
         "ABOUT SMARTSMBAI",
-        "SmartSMBAI delivers productized AI systems — receptionists, lead agents, and support assistants — for small and medium businesses. We are expanding our Growth Agent network across {region}.".format(region=region),
+        "SmartSMBAI delivers productized AI systems — receptionists, lead agents, and support assistants — for small and medium businesses. We are expanding our Growth Agent network.",
         "",
         "THE OPPORTUNITY",
         data.get("role_summary", ""),
@@ -195,7 +216,7 @@ def _assemble_jd(data: dict, region: str, eeo: str) -> str:
         "",
         "HOW TO APPLY",
         "Send your background and the local business network you would bring to info@smartsmbai.com",
-        f"Subject line: Application — Growth Agent — {region} — [Your Name]",
+        f"Subject line: Application - Growth Agent - {region} - [Your Name]",
         "",
         eeo,
     ]
